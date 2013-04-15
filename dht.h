@@ -48,6 +48,7 @@ void dht_dump_tables(FILE *f);
 int dht_get_nodes(struct sockaddr_in *sin, int *num,
                   struct sockaddr_in6 *sin6, int *num6);
 int dht_uninit(void);
+int dht_store(const unsigned char *key, const unsigned char *value, int value_len, int af);
 
 /* This must be provided by the user. */
 int dht_blacklisted(const struct sockaddr *sa, int salen);

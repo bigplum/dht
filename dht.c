@@ -173,6 +173,9 @@ struct search {
     unsigned char id[20];
     unsigned short port;        /* 0 for pure searches */
     int done;
+    int flag;                   /* 0-search peers, 1-search keys */
+    unsigned char *value;
+    int value_len;
     struct search_node nodes[SEARCH_NODES];
     int numnodes;
     struct search *next;
@@ -244,6 +247,10 @@ static int send_peer_announced(const struct sockaddr *sa, int salen,
 static int send_error(const struct sockaddr *sa, int salen,
                       unsigned char *tid, int tid_len,
                       int code, const char *message);
+static void store_step(struct search *sr);
+static int send_stored(const struct sockaddr *sa, int salen,
+                    unsigned char *tid, int tid_len);
+
 
 #define ERROR 0
 #define REPLY 1
@@ -251,6 +258,8 @@ static int send_error(const struct sockaddr *sa, int salen,
 #define FIND_NODE 3
 #define GET_PEERS 4
 #define ANNOUNCE_PEER 5
+#define STORE 6
+#define FIND_VALUE 7
 
 #define WANT4 1
 #define WANT6 2
@@ -266,6 +275,8 @@ static int parse_message(const unsigned char *buf, int buflen,
                          unsigned char *nodes6_return, int *nodes6_len,
                          unsigned char *values_return, int *values_len,
                          unsigned char *values6_return, int *values6_len,
+                         unsigned char *key_return,
+                         unsigned char *value_return, int *value_len,
                          int *want_return);
 
 static const unsigned char zeroes[20] = {0};
@@ -340,6 +351,14 @@ debug_printable(const unsigned char *buf, int buflen)
         for(i = 0; i < buflen; i++)
             putc(buf[i] >= 32 && buf[i] <= 126 ? buf[i] : '.', dht_debug);
     }
+}
+
+static void
+print_char(FILE *f, const unsigned char *buf, int buflen)
+{
+    int i;
+    for(i = 0; i < buflen; i++)
+        fprintf(f, "%c", buf[i]);
 }
 
 static void
@@ -945,7 +964,7 @@ insert_search_node(unsigned char *id,
         debugf("Attempted to insert node in the wrong family.\n");
         return 0;
     }
-
+    
     for(i = 0; i < sr->numnodes; i++) {
         if(id_cmp(id, sr->nodes[i].id) == 0) {
             n = &sr->nodes[i];
@@ -1234,6 +1253,7 @@ dht_search(const unsigned char *id, int port, int af,
         sr->af = af;
         sr->tid = search_id++;
         sr->step_time = 0;
+        sr->flag = 0;
         memcpy(sr->id, id, 20);
         sr->done = 0;
         sr->numnodes = 0;
@@ -1491,7 +1511,7 @@ dump_bucket(FILE *f, struct bucket *b)
         char buf[512];
         unsigned short port;
         fprintf(f, "    Node ");
-        print_hex(f, n->id, 20);
+        print_char(f, n->id, 20);
         if(n->ss.ss_family == AF_INET) {
             struct sockaddr_in *sin = (struct sockaddr_in*)&n->ss;
             inet_ntop(AF_INET, &sin->sin_addr, buf, 512);
@@ -1534,7 +1554,7 @@ dht_dump_tables(FILE *f)
     struct search *sr = searches;
 
     fprintf(f, "My id ");
-    print_hex(f, myid, 20);
+    print_char(f, myid, 20);
     fprintf(f, "\n");
 
     b = buckets;
@@ -1559,7 +1579,7 @@ dht_dump_tables(FILE *f)
         for(i = 0; i < sr->numnodes; i++) {
             struct search_node *n = &sr->nodes[i];
             fprintf(f, "Node %d id ", i);
-            print_hex(f, n->id, 20);
+            print_char(f, n->id, 20);
             fprintf(f, " bits %d age ", common_bits(sr->id, n->id));
             if(n->request_time)
                 fprintf(f, "%d, ", (int)(now.tv_sec - n->request_time));
@@ -1873,13 +1893,13 @@ dht_periodic(const void *buf, size_t buflen,
 
     if(buflen > 0) {
         int message;
-        unsigned char tid[16], id[20], info_hash[20], target[20];
+        unsigned char tid[16], id[20], info_hash[20], target[20], key[20];
         unsigned char nodes[256], nodes6[1024], token[128];
         int tid_len = 16, token_len = 128;
         int nodes_len = 256, nodes6_len = 1024;
         unsigned short port;
-        unsigned char values[2048], values6[2048];
-        int values_len = 2048, values6_len = 2048;
+        unsigned char values[2048], values6[2048], value[2048];
+        int values_len = 2048, values6_len = 2048, value_len = 2048;
         int want;
         unsigned short ttid;
 
@@ -1901,6 +1921,7 @@ dht_periodic(const void *buf, size_t buflen,
                                 target, &port, token, &token_len,
                                 nodes, &nodes_len, nodes6, &nodes6_len,
                                 values, &values_len, values6, &values6_len,
+                                key, value, &value_len,
                                 &want);
 
         if(message < 0 || message == ERROR || id_cmp(id, zeroes) == 0) {
@@ -1946,8 +1967,10 @@ dht_periodic(const void *buf, size_t buflen,
                     gp = 1;
                     sr = find_search(ttid, from->sa_family);
                 }
+                
                 debugf("Nodes found (%d+%d)%s!\n", nodes_len/26, nodes6_len/38,
                        gp ? " for get_peers" : "");
+                       
                 if(nodes_len % 26 != 0 || nodes6_len % 38 != 0) {
                     debugf("Unexpected length for node info!\n");
                     blacklist_node(id, from, fromlen);
@@ -1966,6 +1989,11 @@ dht_periodic(const void *buf, size_t buflen,
                         sin.sin_family = AF_INET;
                         memcpy(&sin.sin_addr, ni + 20, 4);
                         memcpy(&sin.sin_port, ni + 24, 2);
+                        
+                        char   *temp;
+                        temp = inet_ntoa(sin.sin_addr);
+                        printf("======== node %s:%d\n", temp, sin.sin_port);
+
                         new_node(ni, (struct sockaddr*)&sin, sizeof(sin), 0);
                         if(sr && sr->af == AF_INET) {
                             insert_search_node(ni,
@@ -2003,6 +2031,7 @@ dht_periodic(const void *buf, size_t buflen,
                     if(values_len > 0 || values6_len > 0) {
                         debugf("Got values (%d+%d)!\n",
                                values_len / 6, values6_len / 18);
+                        printf("Got token (%s)\n", token);
                         if(callback) {
                             if(values_len > 0)
                                 (*callback)(closure, DHT_EVENT_VALUES, sr->id,
@@ -2012,7 +2041,10 @@ dht_periodic(const void *buf, size_t buflen,
                                 (*callback)(closure, DHT_EVENT_VALUES6, sr->id,
                                             (void*)values6, values6_len);
                         }
+                    }else{
+                        printf("No values\n");
                     }
+                    
                 }
             } else if(tid_match(tid, "ap", &ttid)) {
                 struct search *sr;
@@ -2035,6 +2067,16 @@ dht_periodic(const void *buf, size_t buflen,
                     /* See comment for gp above. */
                     search_send_get_peers(sr, NULL);
                 }
+            } else if(tid_match(tid, "st", &ttid) ) {                   
+                    debugf("Got reply to store.\n");
+
+                    struct search *sr = NULL;
+                    sr = find_search(ttid, from->sa_family);
+                    
+                    if(sr) {
+                        insert_search_node(id, from, fromlen, sr,
+                                           1, token, token_len);
+                    }
             } else {
                 debugf("Unexpected reply: ");
                 debug_printable(buf, buflen);
@@ -2110,6 +2152,13 @@ dht_periodic(const void *buf, size_t buflen,
                polluting the DHT. */
             debugf("Sending peer announced.\n");
             send_peer_announced(from, fromlen, tid, tid_len);
+            break;
+            
+        case STORE:
+            debugf("stored and send reply!");
+            new_node(id, from, fromlen, 1);
+            storage_store(key, from, port);
+            send_stored(from, fromlen, tid, tid_len);
         }
     }
 
@@ -2128,8 +2177,11 @@ dht_periodic(const void *buf, size_t buflen,
         struct search *sr;
         sr = searches;
         while(sr) {
-            if(!sr->done && sr->step_time + 5 <= now.tv_sec) {
+            if(!sr->flag && !sr->done && sr->step_time + 5 <= now.tv_sec) {
                 search_step(sr, callback, closure);
+            }
+            if(1 == sr->flag && !sr->done && sr->step_time + 5 <= now.tv_sec) {
+                store_step(sr);
             }
             sr = sr->next;
         }
@@ -2335,8 +2387,229 @@ dht_send(const void *buf, size_t len, int flags,
         return -1;
     }
 
+/*
+    char   *temp;
+    temp = inet_ntoa(((struct sockaddr_in*)sa)->sin_addr);
+    printf("====>>>> To %s: %s\n", temp, (char *)buf);
+*/
     return sendto(s, buf, len, flags, sa, salen);
 }
+
+
+int
+send_store(const struct sockaddr *sa, int salen,
+                   unsigned char *tid, int tid_len,
+                   unsigned char *key,
+                   const unsigned char *value, int value_len)
+{
+    char buf[512];
+    int i = 0, rc;
+
+    rc = snprintf(buf + i, 512 - i, "d1:ad2:id20:"); INC(i, rc, 512);
+    COPY(buf, i, myid, 20, 512);
+    rc = snprintf(buf + i, 512 - i, "3:key20:"); INC(i, rc, 512);
+    COPY(buf, i, key, 20, 512);
+    rc = snprintf(buf + i, 512 - i, "5:value%d:", value_len);
+    INC(i, rc, 512);
+    COPY(buf, i, value, value_len, 512);
+    rc = snprintf(buf + i, 512 - i, "e1:q5:store1:t%d:", tid_len);
+    INC(i, rc, 512);
+    COPY(buf, i, tid, tid_len, 512);
+    ADD_V(buf, i, 512);
+    rc = snprintf(buf + i, 512 - i, "1:y1:qe"); INC(i, rc, 512);
+
+    return dht_send(buf, i, 0, sa, salen);
+
+ fail:
+    errno = ENOSPC;
+    return -1;
+}
+
+
+static int
+send_stored(const struct sockaddr *sa, int salen,
+                    unsigned char *tid, int tid_len)
+{
+    char buf[512];
+    int i = 0, rc;
+
+    rc = snprintf(buf + i, 512 - i, "d1:rd2:id20:"); INC(i, rc, 512);
+    COPY(buf, i, myid, 20, 512);
+    rc = snprintf(buf + i, 512 - i, "e1:t%d:", tid_len);
+    INC(i, rc, 512);
+    COPY(buf, i, tid, tid_len, 512);
+    ADD_V(buf, i, 512);
+    rc = snprintf(buf + i, 512 - i, "1:y1:re"); INC(i, rc, 512);
+    return dht_send(buf, i, 0, sa, salen);
+
+ fail:
+    errno = ENOSPC;
+    return -1;
+}
+
+
+/* This must always return 0 or 1, never -1, not even on failure (see below). */
+static int
+search_send_store(struct search *sr, struct search_node *n)
+{
+    struct node *node;
+    unsigned char tid[4];
+
+    if(n == NULL) {
+        int i;
+        for(i = 0; i < sr->numnodes; i++) {
+            if(sr->nodes[i].pinged < 3 && !sr->nodes[i].replied &&
+               sr->nodes[i].request_time < now.tv_sec - 15)
+                n = &sr->nodes[i];
+        }
+    }
+
+    if(!n || n->pinged >= 3 || n->replied ||
+       n->request_time >= now.tv_sec - 15)
+        return 0;
+
+    debugf("Sending store.\n");
+    make_tid(tid, "st", sr->tid);
+    send_store((struct sockaddr*)&n->ss, n->sslen, tid, 4, sr->id, sr->value, sr->value_len);
+    n->pinged++;
+    n->request_time = now.tv_sec;
+    /* If the node happens to be in our main routing table, mark it
+       as pinged. */
+    node = find_node(n->id, n->ss.ss_family);
+    if(node) pinged(node, NULL);
+    return 1;
+}
+
+
+/* When a search is in progress, we periodically call search_step to send
+   further requests. */
+static void
+store_step(struct search *sr)
+{
+    int i, j;
+    int all_done = 1;
+
+    /* Check if the first 8 live nodes have replied. */
+    j = 0;
+    for(i = 0; i < sr->numnodes && j < 8; i++) {
+        struct search_node *n = &sr->nodes[i];
+        if(n->pinged >= 3)
+            continue;
+        if(!n->replied) {
+            all_done = 0;
+            break;
+        }
+        j++;
+    }
+
+    if(all_done) {
+        if(sr->port == 0) {
+            goto done;
+        } else {
+            int all_acked = 1;
+            j = 0;
+            if(all_acked)
+                goto done;
+        }
+        sr->step_time = now.tv_sec;
+        return;
+    }
+
+    if(sr->step_time + 15 >= now.tv_sec)
+        return;
+
+    j = 0;
+    for(i = 0; i < sr->numnodes; i++) {
+        j += search_send_store(sr, &sr->nodes[i]);
+        if(j >= 3)
+            break;
+    }
+    sr->step_time = now.tv_sec;
+    return;
+
+ done:
+    sr->done = 1;
+    sr->step_time = now.tv_sec;
+}
+
+
+/* store a key-value pair into dht */
+int
+dht_store(const unsigned char *key, const unsigned char *value, int value_len, int af)
+{
+    struct search *sr;
+    struct bucket *b = find_bucket(key, af);
+
+    if(b == NULL) {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
+
+    sr = searches;
+    while(sr) {
+        if(sr->af == af && id_cmp(sr->id, key) == 0)
+            break;
+        sr = sr->next;
+    }
+
+    if(sr) {
+        /* We're reusing data from an old search.  Reusing the same tid
+           means that we can merge replies for both searches. */
+        int i;
+        sr->done = 0;
+    again:
+        for(i = 0; i < sr->numnodes; i++) {
+            struct search_node *n;
+            n = &sr->nodes[i];
+            /* Discard any doubtful nodes. */
+            if(n->pinged >= 3 || n->reply_time < now.tv_sec - 7200) {
+                flush_search_node(n, sr);
+                goto again;
+            }
+            n->pinged = 0;
+            n->token_len = 0;
+            n->replied = 0;
+            n->acked = 0;
+        }
+    } else {
+        sr = new_search();
+        if(sr == NULL) {
+            errno = ENOSPC;
+            return -1;
+        }
+        sr->af = af;
+        sr->tid = search_id++;
+        sr->step_time = 0;
+        sr->flag = 1;
+        sr->value = calloc(value_len, 1);
+        memcpy(sr->value, value, value_len);
+        sr->value_len = value_len;
+        memcpy(sr->id, key, 20);
+        sr->done = 0;
+        sr->numnodes = 0;
+    }
+
+    sr->port = 0;
+
+    insert_search_bucket(b, sr);
+
+    if(sr->numnodes < SEARCH_NODES) {
+        struct bucket *p = previous_bucket(b);
+        if(b->next)
+            insert_search_bucket(b->next, sr);
+        if(p)
+            insert_search_bucket(p, sr);
+    }
+    if(sr->numnodes < SEARCH_NODES)
+        insert_search_bucket(find_bucket(myid, af), sr);
+
+    store_step(sr);
+    search_time = now.tv_sec;
+
+    return 1;
+
+}
+
 
 int
 send_ping(const struct sockaddr *sa, int salen,
@@ -2684,6 +2957,33 @@ send_error(const struct sockaddr *sa, int salen,
     return -1;
 }
 
+
+int
+send_find_value(const struct sockaddr *sa, int salen,
+                   unsigned char *tid, int tid_len,
+                   unsigned char *key)
+{
+    char buf[512];
+    int i = 0, rc;
+
+    rc = snprintf(buf + i, 512 - i, "d1:ad2:id20:"); INC(i, rc, 512);
+    COPY(buf, i, myid, 20, 512);
+    rc = snprintf(buf + i, 512 - i, "3:key20:"); INC(i, rc, 512);
+    COPY(buf, i, key, 20, 512);
+    rc = snprintf(buf + i, 512 - i, "e1:q5:find_value1:t%d:", tid_len);
+    INC(i, rc, 512);
+    COPY(buf, i, tid, tid_len, 512);
+    ADD_V(buf, i, 512);
+    rc = snprintf(buf + i, 512 - i, "1:y1:qe"); INC(i, rc, 512);
+
+    return dht_send(buf, i, 0, sa, salen);
+
+ fail:
+    errno = ENOSPC;
+    return -1;
+}
+
+
 #undef CHECK
 #undef INC
 #undef COPY
@@ -2731,6 +3031,8 @@ parse_message(const unsigned char *buf, int buflen,
               unsigned char *nodes6_return, int *nodes6_len,
               unsigned char *values_return, int *values_len,
               unsigned char *values6_return, int *values6_len,
+              unsigned char *key_return,
+              unsigned char *value_return, int *value_len,
               int *want_return)
 {
     const unsigned char *p;
@@ -2912,6 +3214,34 @@ parse_message(const unsigned char *buf, int buflen,
         }
     }
 
+    if(key_return) {
+        p = dht_memmem(buf, buflen, "3:key20:", 8);
+        if(p) {
+            CHECK(p + 8, 20);
+            memcpy(key_return, p + 8, 20);
+        } else {
+            memset(key_return, 0, 20);
+        }
+    }
+    
+    if(value_return) {
+        p = dht_memmem(buf, buflen, "5:value", 7);
+        if(p) {
+            long l;
+            char *q;
+            l = strtol((char*)p + 7, &q, 10);
+            if(q && *q == ':' && l > 0 && l < *value_len) {
+                CHECK(q + 1, l);
+                memcpy(value_return, q + 1, l);
+                *value_len = l;
+            } else
+                *value_len = 0;
+        } else
+            *value_len = 0;
+
+    }
+
+
 #undef CHECK
 
     if(dht_memmem(buf, buflen, "1:y1:r", 6))
@@ -2928,6 +3258,10 @@ parse_message(const unsigned char *buf, int buflen,
         return GET_PEERS;
     if(dht_memmem(buf, buflen, "1:q13:announce_peer", 19))
        return ANNOUNCE_PEER;
+    if(dht_memmem(buf, buflen, "1:q5:store", 10))
+       return STORE;
+    if(dht_memmem(buf, buflen, "1:q10:find_value", 19))
+       return FIND_VALUE;
     return -1;
 
  overflow:
